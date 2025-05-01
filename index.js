@@ -7,7 +7,7 @@ import cron from 'node-cron'
 
 dotenv.config()
 
-// ─── Env Vars ─────────────────────────────────────────────────
+// ─── Env vars & validation ─────────────────────────────────────
 const {
   SHEET_ID,
   KEYWORD_SHEET_ID,
@@ -18,20 +18,20 @@ const {
   PORT = 3000
 } = process.env
 
-for (let v of [
+for (const key of [
   'SHEET_ID',
   'KEYWORD_SHEET_ID',
   'WHATSAPP_VERIFY_TOKEN',
   'GOOGLE_SERVICE_ACCOUNT_EMAIL',
   'GOOGLE_PRIVATE_KEY'
 ]) {
-  if (!process.env[v]) {
-    console.error(`Missing env var: ${v}`)
+  if (!process.env[key]) {
+    console.error(`❌ Missing env var: ${key}`)
     process.exit(1)
   }
 }
 
-// ─── Google Sheets setup ──────────────────────────────────────
+// ─── Google Sheets client ──────────────────────────────────────
 const auth = new google.auth.JWT(
   GOOGLE_SERVICE_ACCOUNT_EMAIL,
   null,
@@ -40,59 +40,54 @@ const auth = new google.auth.JWT(
 )
 const sheets = google.sheets({ version: 'v4', auth })
 
-// ─── Keyword patterns ─────────────────────────────────────────
-let leadPatterns = []    // [{ label, pattern }]
-let typePatterns = []    // [{ label, pattern }]
-let statusRules  = []    // [{ status, pattern }]
-let remarkPatterns = []  // [{ label, pattern }]
+// ─── Keyword patterns (loaded once) ────────────────────────────
+let loaded = false
+let leadPatterns = []
+let typePatterns = []
+let statusRules = []
+let remarkPatterns = []
 
-async function loadKeywords() {
-  const ls = await sheets.spreadsheets.values.get({
-    spreadsheetId: KEYWORD_SHEET_ID,
-    range: 'LeadSources!A2:B'
-  })
-  leadPatterns = (ls.data.values||[])
-    .map(([label, pat]) => ({ label, pattern: pat||label }))
-
-  const pt = await sheets.spreadsheets.values.get({
-    spreadsheetId: KEYWORD_SHEET_ID,
-    range: 'ProductTypes!A2:B'
-  })
-  typePatterns = (pt.data.values||[])
-    .map(([label, pat]) => ({ label, pattern: pat||label }))
-
-  const sr = await sheets.spreadsheets.values.get({
-    spreadsheetId: KEYWORD_SHEET_ID,
-    range: 'StatusRules!A2:B'
-  })
-  statusRules = (sr.data.values||[])
-    .map(([status, pat]) => ({ status, pattern: pat }))
-
-  const rp = await sheets.spreadsheets.values.get({
-    spreadsheetId: KEYWORD_SHEET_ID,
-    range: 'RemarkPatterns!A2:B'
-  })
-  remarkPatterns = (rp.data.values||[])
-    .map(([label, pat]) => ({ label, pattern: pat }))
+async function ensureKeywords() {
+  if (loaded) return
+  const [ls, pt, sr, rp] = await Promise.all([
+    sheets.spreadsheets.values.get({
+      spreadsheetId: KEYWORD_SHEET_ID,
+      range: 'LeadSources!A2:B'
+    }),
+    sheets.spreadsheets.values.get({
+      spreadsheetId: KEYWORD_SHEET_ID,
+      range: 'ProductTypes!A2:B'
+    }),
+    sheets.spreadsheets.values.get({
+      spreadsheetId: KEYWORD_SHEET_ID,
+      range: 'StatusRules!A2:B'
+    }),
+    sheets.spreadsheets.values.get({
+      spreadsheetId: KEYWORD_SHEET_ID,
+      range: 'RemarkPatterns!A2:B'
+    })
+  ])
+  leadPatterns  = (ls.data.values  || []).map(([label, pat]) => ({ label, pattern: pat || label }))
+  typePatterns  = (pt.data.values  || []).map(([label, pat]) => ({ label, pattern: pat || label }))
+  statusRules   = (sr.data.values  || []).map(([status, pat]) => ({ status, pattern: pat }))
+  remarkPatterns= (rp.data.values  || []).map(([label, pat]) => ({ label, pattern: pat }))
+  loaded = true
 }
 
 // ─── Text analysis ────────────────────────────────────────────
 function analyzeText(text) {
-  const leads = leadPatterns.find(r => new RegExp(r.pattern, 'i').test(text))
-                ?.label || 'Unknown Leads'
-  const status = statusRules.find(r => new RegExp(r.pattern, 'i').test(text))
-                 ?.status || 'in progress'
-  const type = typePatterns.find(r => new RegExp(r.pattern, 'i').test(text))
-               ?.label || 'others'
-  let remarks = ''
-  for (let { pattern } of remarkPatterns) {
+  const leads  = leadPatterns.find(r => new RegExp(r.pattern, 'i').test(text))?.label || 'Unknown Leads'
+  const status = statusRules.find(r => new RegExp(r.pattern, 'i').test(text))?.status || 'in progress'
+  const type   = typePatterns.find(r => new RegExp(r.pattern, 'i').test(text))?.label  || 'others'
+  let remarks  = ''
+  for (const { pattern } of remarkPatterns) {
     const m = new RegExp(pattern, 'i').exec(text)
-    if (m && m[1]) { remarks = m[1].trim(); break }
+    if (m?.[1]) { remarks = m[1].trim(); break }
   }
   return { leads, status, type, remarks }
 }
 
-// ─── Sheet upsert helpers ─────────────────────────────────────
+// ─── Sheet upsert helpers ──────────────────────────────────────
 async function findRowByContact(phone) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
@@ -103,7 +98,7 @@ async function findRowByContact(phone) {
 }
 
 async function upsertLead({ date, name, phone, leads, status, remarks, type }) {
-  const row = [date, name, phone, leads, status, remarks, type, '', '']
+  const row = [ date, name, phone, leads, status, remarks, type, '', '' ]
   const idx = await findRowByContact(phone)
   if (idx >= 0) {
     const rowNum = idx + 2
@@ -124,71 +119,77 @@ async function upsertLead({ date, name, phone, leads, status, remarks, type }) {
   }
 }
 
-// ─── Process one WhatsApp message ─────────────────────────────
-async function processMessage(msg, contacts) {
-  const phone = msg.from
-  const date  = new Date(Number(msg.timestamp)*1000).toISOString().split('T')[0]
-  const name  = contacts.find(c=>c.wa_id===phone)?.profile.name || ''
-  const text  = msg.text?.body || ''
-  const { leads, status, type, remarks } = analyzeText(text)
-  await upsertLead({ date, name, phone, leads, status, remarks, type })
-}
-
-// ─── Cron: mark “in progress” >7 days as “no reply” ───────────
-cron.schedule('0 0 * * *', async ()=>{
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A2:E`
-  })
-  const rows = res.data.values||[]
-  const now = Date.now()
-  for (let i=0; i<rows.length; i++){
-    const [date,, , , status] = rows[i]
-    if (status==='in progress') {
-      const ts = new Date(date).getTime()
-      if (now - ts > 7*24*3600*1000) {
-        const rowNum = i+2
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: SHEET_ID,
-          range: `${SHEET_NAME}!E${rowNum}:E${rowNum}`,
-          valueInputOption: 'RAW',
-          requestBody:{ values:[['no reply']] }
-        })
+// ─── Cron job: mark stale leads “no reply” ──────────────────────
+cron.schedule('0 0 * * *', async () => {
+  try {
+    const now = Date.now()
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `${SHEET_NAME}!A2:E`
+    })
+    const rows = res.data.values || []
+    for (let i = 0; i < rows.length; i++) {
+      const [ date, , , , stat ] = rows[i]
+      if (stat === 'in progress') {
+        const ts = new Date(date).getTime()
+        if (now - ts > 7 * 24 * 3600 * 1000) {
+          const rowNum = i + 2
+          await sheets.spreadsheets.values.update({
+            spreadsheetId: SHEET_ID,
+            range: `${SHEET_NAME}!E${rowNum}:E${rowNum}`,
+            valueInputOption: 'RAW',
+            requestBody: { values: [['no reply']] }
+          })
+        }
       }
     }
+  } catch (err) {
+    console.error('Cron job error:', err)
   }
 })
 
-// ─── Express server ───────────────────────────────────────────
+// ─── Express setup ────────────────────────────────────────────
 const app = express()
 app.use(bodyParser.json())
 
-// Verify token handshake
-app.get('/webhook',(req,res)=>{
-  if (req.query['hub.verify_token']===WHATSAPP_VERIFY_TOKEN)
-    return res.status(200).send(req.query['hub.challenge'])
+// Health-check
+app.get('/', (_req, res) => {
+  res.status(200).send('✅ WhatsApp-Leads webhook is up')
+})
+
+// Webhook verification
+app.get('/webhook', (req, res) => {
+  const mode      = req.query['hub.mode']
+  const token     = req.query['hub.verify_token']
+  const challenge = req.query['hub.challenge']
+  if (mode === 'subscribe' && token === WHATSAPP_VERIFY_TOKEN) {
+    return res.status(200).send(challenge)
+  }
   res.status(403).send('Forbidden')
 })
 
-// Ingest messages
-app.post('/webhook',async(req,res)=>{
+// Incoming messages
+app.post('/webhook', async (req, res) => {
   try {
-    for (let entry of req.body.entry||[]) {
-      for (let change of entry.changes||[]) {
-        for (let msg of change.value.messages||[]) {
-          await processMessage(msg, change.value.contacts||[])
+    await ensureKeywords()
+    for (const entry of req.body.entry || []) {
+      for (const change of entry.changes || []) {
+        const contacts = change.value.contacts || []
+        for (const msg of change.value.messages || []) {
+          const date  = new Date(Number(msg.timestamp) * 1000).toISOString().split('T')[0]
+          const phone = msg.from
+          const name  = contacts.find(c => c.wa_id === phone)?.profile.name || ''
+          const text  = msg.text?.body || ''
+          const { leads, status, type, remarks } = analyzeText(text)
+          await upsertLead({ date, name, phone, leads, status, remarks, type })
         }
       }
     }
     res.status(200).send('OK')
-  } catch(e) {
-    console.error(e)
+  } catch (err) {
+    console.error('POST /webhook error:', err)
     res.status(500).send('Error')
   }
 })
 
-// ─── Start ────────────────────────────────────────────────────
-;(async ()=>{
-  await loadKeywords()
-  app.listen(PORT,()=>console.log(`Listening on port ${PORT}`))
-})()
+export default app
