@@ -65,56 +65,42 @@ async function ensureKeywords() {
     })
   ])
 
-  leadPatterns   = (ls.data.values   || []).map(([label,pat]) => ({
-    label,
-    pattern: (pat||label).trim()
-  }))
-  typePatterns   = (pt.data.values   || []).map(([label,pat]) => ({
-    label,
-    pattern: (pat||label).trim()
-  }))
-  statusRules    = (sr.data.values   || []).map(([status,pat]) => ({
-    status,
-    pattern: pat.trim()
-  }))
-  remarkPatterns = (rp.data.values   || []).map(([label,pat]) => {
-    // clean out stray backticks and trim
-    const raw = (pat || '').trim().replace(/`/g, '')
-    return { label, pattern: raw }
-  })
+  leadPatterns   = (ls.data.values   || []).map(([label,pat]) => ({ label, pattern: (pat||label).trim() }))
+  typePatterns   = (pt.data.values   || []).map(([label,pat]) => ({ label, pattern: (pat||label).trim() }))
+  statusRules    = (sr.data.values   || []).map(([status,pat])=> ({ status, pattern: pat.trim() }))
+  remarkPatterns = (rp.data.values   || []).map(([label,pat])=> ({ label, pattern: (pat||'').trim().replace(/`/g,'') }))
 
   loaded = true
 }
 
 // ─── Text Analysis ─────────────────────────────────────────────
 function analyzeText(text) {
-  // safely compile and test each pattern; skip invalid ones
-  function findLabel(arr, defaultVal, prop='label') {
+  function find(arr, defaultVal, prop='label') {
     for (const entry of arr) {
       try {
-        const re = new RegExp(entry.pattern, 'i')
-        if (re.test(text)) return entry[prop]
+        if (new RegExp(entry.pattern, 'i').test(text)) {
+          return entry[prop]
+        }
       } catch (_) {
-        // invalid regex—skip
         continue
       }
     }
     return defaultVal
   }
 
-  const leads  = findLabel(leadPatterns,  'Unknown Leads', 'label')
-  const status = findLabel(statusRules,   'in progress', 'status')
-  const type   = findLabel(typePatterns,   'others',      'label')
+  const leads  = find(leadPatterns,  'Unknown Leads', 'label')
+  const status = find(statusRules,   'in progress', 'status')
+  const type   = find(typePatterns,   'others',      'label')
 
   let remarks = ''
   for (const { pattern } of remarkPatterns) {
     try {
-      const re = new RegExp(pattern, 'i')
-      const m  = re.exec(text)
-      if (m?.[1]) { remarks = m[1].trim(); break }
-    } catch (_) {
-      continue
-    }
+      const m = new RegExp(pattern, 'i').exec(text)
+      if (m?.[1]) {
+        remarks = m[1].trim()
+        break
+      }
+    } catch (_) { continue }
   }
 
   return { leads, status, type, remarks }
@@ -133,15 +119,17 @@ async function findRowByContact(phone) {
 async function upsertLead({ date, name, phone, leads, status, remarks, type }) {
   const row = [ date, name, phone, leads, status, remarks, type, '', '' ]
   const idx = await findRowByContact(phone)
+  console.log(`   ↪ [Upsert] phone=${phone}, idx=${idx}, row=${JSON.stringify(row)}`)
   if (idx >= 0) {
-    const rowNum = idx + 2
+    console.log(`     ✏️  Updating row ${idx+2}`)
     await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
-      range: `${SHEET_NAME}!A${rowNum}:I${rowNum}`,
+      range: `${SHEET_NAME}!A${idx+2}:I${idx+2}`,
       valueInputOption: 'RAW',
       requestBody: { values: [row] }
     })
   } else {
+    console.log('     ➕ Appending new row')
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: `${SHEET_NAME}!A2:I`,
@@ -167,6 +155,7 @@ cron.schedule('0 0 * * *', async () => {
         const ts = new Date(date).getTime()
         if (now - ts > 7 * 24 * 3600 * 1000) {
           const rowNum = i + 2
+          console.log(`🔄 Marking row ${rowNum} as no reply`)
           await sheets.spreadsheets.values.update({
             spreadsheetId: SHEET_ID,
             range: `${SHEET_NAME}!E${rowNum}:E${rowNum}`,
@@ -185,29 +174,47 @@ cron.schedule('0 0 * * *', async () => {
 const app = express()
 app.use(bodyParser.json())
 
+// Health check
 app.get('/', (_req, res) => {
   res.status(200).send('✅ WhatsApp‐Leads webhook is up')
 })
 
+// Webhook handshake
 app.get('/webhook', (req, res) => {
-  const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': chal } = req.query
+  const mode      = req.query['hub.mode']
+  const token     = req.query['hub.verify_token']
+  const challenge = req.query['hub.challenge']
   if (mode === 'subscribe' && token === WHATSAPP_VERIFY_TOKEN) {
-    return res.status(200).send(chal)
+    return res.status(200).send(challenge)
   }
   res.status(403).send('Forbidden')
 })
 
+// Incoming messages
 app.post('/webhook', async (req, res) => {
+  console.log('🔔 [Webhook] payload:', JSON.stringify(req.body))
   try {
-    // … your normal logic …
-    return res.status(200).send('OK')
+    await ensureKeywords()
+    for (const entry of req.body.entry || []) {
+      for (const change of entry.changes || []) {
+        const contacts = change.value.contacts || []
+        for (const msg of change.value.messages || []) {
+          console.log(`   • [Msg] from=${msg.from}, body="${msg.text?.body}"`)
+          const date  = new Date(Number(msg.timestamp) * 1000).toISOString().split('T')[0]
+          const phone = msg.from
+          const name  = contacts.find(c => c.wa_id === phone)?.profile.name || ''
+          const text  = msg.text?.body || ''
+          const parsed = analyzeText(text)
+          await upsertLead({ date, name, phone, ...parsed })
+        }
+      }
+    }
+    res.status(200).send('OK')
   } catch (err) {
-    console.error('POST /webhook error:', err)
-    // send the actual error text back in the response (temporary)
-    return res.status(500).send(err.stack || err.toString())
+    console.error('[Webhook] Error:', err)
+    res.status(500).send(err.stack || err.toString())
   }
 })
-
 
 // ─── Local‐only HTTP Listener ──────────────────────────────────
 if (!process.env.VERCEL) {
