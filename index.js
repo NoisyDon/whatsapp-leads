@@ -199,26 +199,15 @@ app.get('/webhook', (req, res) => {
 
 app.post('/webhook', async (req, res) => {
   try {
-    await ensureKeywords()
-    for (const entry of req.body.entry || []) {
-      for (const change of entry.changes || []) {
-        const contacts = change.value.contacts || []
-        for (const msg of change.value.messages || []) {
-          const date  = new Date(Number(msg.timestamp) * 1000).toISOString().split('T')[0]
-          const phone = msg.from
-          const name  = contacts.find(c => c.wa_id === phone)?.profile.name || ''
-          const text  = msg.text?.body || ''
-          const parsed = analyzeText(text)
-          await upsertLead({ date, name, phone, ...parsed })
-        }
-      }
-    }
-    res.status(200).send('OK')
+    // … your normal logic …
+    return res.status(200).send('OK')
   } catch (err) {
     console.error('POST /webhook error:', err)
-    res.status(500).send('Error')
+    // send the actual error text back in the response (temporary)
+    return res.status(500).send(err.stack || err.toString())
   }
 })
+
 
 // ─── Local‐only HTTP Listener ──────────────────────────────────
 if (!process.env.VERCEL) {
