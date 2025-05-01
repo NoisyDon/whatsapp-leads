@@ -7,7 +7,7 @@ import cron from 'node-cron'
 
 dotenv.config()
 
-// ─── Env vars & validation ─────────────────────────────────────
+// ─── Env Vars & Validation ─────────────────────────────────────
 const {
   SHEET_ID,
   KEYWORD_SHEET_ID,
@@ -15,7 +15,7 @@ const {
   WHATSAPP_VERIFY_TOKEN,
   GOOGLE_SERVICE_ACCOUNT_EMAIL,
   GOOGLE_PRIVATE_KEY,
-  PORT = 3000
+  PORT = '3000'
 } = process.env
 
 for (const key of [
@@ -31,7 +31,7 @@ for (const key of [
   }
 }
 
-// ─── Google Sheets client ──────────────────────────────────────
+// ─── Google Sheets Client ──────────────────────────────────────
 const auth = new google.auth.JWT(
   GOOGLE_SERVICE_ACCOUNT_EMAIL,
   null,
@@ -40,16 +40,13 @@ const auth = new google.auth.JWT(
 )
 const sheets = google.sheets({ version: 'v4', auth })
 
-// ─── Keyword patterns (loaded once) ────────────────────────────
+// ─── Keyword Patterns (load once) ──────────────────────────────
 let loaded = false
-let leadPatterns = []
-let typePatterns = []
-let statusRules = []
-let remarkPatterns = []
+let leadPatterns = [], typePatterns = [], statusRules = [], remarkPatterns = []
 
 async function ensureKeywords() {
   if (loaded) return
-  const [ls, pt, sr, rp] = await Promise.all([
+  const [ ls, pt, sr, rp ] = await Promise.all([
     sheets.spreadsheets.values.get({
       spreadsheetId: KEYWORD_SHEET_ID,
       range: 'LeadSources!A2:B'
@@ -67,27 +64,63 @@ async function ensureKeywords() {
       range: 'RemarkPatterns!A2:B'
     })
   ])
-  leadPatterns  = (ls.data.values  || []).map(([label, pat]) => ({ label, pattern: pat || label }))
-  typePatterns  = (pt.data.values  || []).map(([label, pat]) => ({ label, pattern: pat || label }))
-  statusRules   = (sr.data.values  || []).map(([status, pat]) => ({ status, pattern: pat }))
-  remarkPatterns= (rp.data.values  || []).map(([label, pat]) => ({ label, pattern: pat }))
+
+  leadPatterns   = (ls.data.values   || []).map(([label,pat]) => ({
+    label,
+    pattern: (pat||label).trim()
+  }))
+  typePatterns   = (pt.data.values   || []).map(([label,pat]) => ({
+    label,
+    pattern: (pat||label).trim()
+  }))
+  statusRules    = (sr.data.values   || []).map(([status,pat]) => ({
+    status,
+    pattern: pat.trim()
+  }))
+  remarkPatterns = (rp.data.values   || []).map(([label,pat]) => {
+    // clean out stray backticks and trim
+    const raw = (pat || '').trim().replace(/`/g, '')
+    return { label, pattern: raw }
+  })
+
   loaded = true
 }
 
-// ─── Text analysis ────────────────────────────────────────────
+// ─── Text Analysis ─────────────────────────────────────────────
 function analyzeText(text) {
-  const leads  = leadPatterns.find(r => new RegExp(r.pattern, 'i').test(text))?.label || 'Unknown Leads'
-  const status = statusRules.find(r => new RegExp(r.pattern, 'i').test(text))?.status || 'in progress'
-  const type   = typePatterns.find(r => new RegExp(r.pattern, 'i').test(text))?.label  || 'others'
-  let remarks  = ''
-  for (const { pattern } of remarkPatterns) {
-    const m = new RegExp(pattern, 'i').exec(text)
-    if (m?.[1]) { remarks = m[1].trim(); break }
+  // safely compile and test each pattern; skip invalid ones
+  function findLabel(arr, defaultVal, prop='label') {
+    for (const entry of arr) {
+      try {
+        const re = new RegExp(entry.pattern, 'i')
+        if (re.test(text)) return entry[prop]
+      } catch (_) {
+        // invalid regex—skip
+        continue
+      }
+    }
+    return defaultVal
   }
+
+  const leads  = findLabel(leadPatterns,  'Unknown Leads', 'label')
+  const status = findLabel(statusRules,   'in progress', 'status')
+  const type   = findLabel(typePatterns,   'others',      'label')
+
+  let remarks = ''
+  for (const { pattern } of remarkPatterns) {
+    try {
+      const re = new RegExp(pattern, 'i')
+      const m  = re.exec(text)
+      if (m?.[1]) { remarks = m[1].trim(); break }
+    } catch (_) {
+      continue
+    }
+  }
+
   return { leads, status, type, remarks }
 }
 
-// ─── Sheet upsert helpers ──────────────────────────────────────
+// ─── Sheet Upsert Helpers ──────────────────────────────────────
 async function findRowByContact(phone) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
@@ -119,7 +152,7 @@ async function upsertLead({ date, name, phone, leads, status, remarks, type }) {
   }
 }
 
-// ─── Cron job: mark stale leads “no reply” ──────────────────────
+// ─── Cron Job: Mark Stale Leads “no reply” ─────────────────────
 cron.schedule('0 0 * * *', async () => {
   try {
     const now = Date.now()
@@ -148,27 +181,22 @@ cron.schedule('0 0 * * *', async () => {
   }
 })
 
-// ─── Express setup ────────────────────────────────────────────
+// ─── Express App & Routes ─────────────────────────────────────
 const app = express()
 app.use(bodyParser.json())
 
-// Health-check
 app.get('/', (_req, res) => {
-  res.status(200).send('✅ WhatsApp-Leads webhook is up')
+  res.status(200).send('✅ WhatsApp‐Leads webhook is up')
 })
 
-// Webhook verification
 app.get('/webhook', (req, res) => {
-  const mode      = req.query['hub.mode']
-  const token     = req.query['hub.verify_token']
-  const challenge = req.query['hub.challenge']
+  const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': chal } = req.query
   if (mode === 'subscribe' && token === WHATSAPP_VERIFY_TOKEN) {
-    return res.status(200).send(challenge)
+    return res.status(200).send(chal)
   }
   res.status(403).send('Forbidden')
 })
 
-// Incoming messages
 app.post('/webhook', async (req, res) => {
   try {
     await ensureKeywords()
@@ -180,8 +208,8 @@ app.post('/webhook', async (req, res) => {
           const phone = msg.from
           const name  = contacts.find(c => c.wa_id === phone)?.profile.name || ''
           const text  = msg.text?.body || ''
-          const { leads, status, type, remarks } = analyzeText(text)
-          await upsertLead({ date, name, phone, leads, status, remarks, type })
+          const parsed = analyzeText(text)
+          await upsertLead({ date, name, phone, ...parsed })
         }
       }
     }
@@ -191,5 +219,13 @@ app.post('/webhook', async (req, res) => {
     res.status(500).send('Error')
   }
 })
+
+// ─── Local‐only HTTP Listener ──────────────────────────────────
+if (!process.env.VERCEL) {
+  const p = Number(PORT) || 3000
+  app.listen(p, () => {
+    console.log(`✅ Local server listening on http://localhost:${p}`)
+  })
+}
 
 export default app
